@@ -254,13 +254,17 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         uint256 tokenId,
         uint256 salePrice
     ) internal view returns (address receiver, uint256 royaltyAmount) {
-        try IERC165(nftContract).supportsInterface(type(IERC2981).interfaceId) returns (bool supported) {
-            if (supported) {
-                return IERC2981(nftContract).royaltyInfo(tokenId, salePrice);
-            }
-        } catch {}
-
-        return (address(0), 0);
+        // 检查NFT合约是否支持ERC2981
+        if (IERC165(nftContract).supportsInterface(type(IERC2981).interfaceId)) {
+            (receiver, royaltyAmount) = IERC2981(nftContract).royaltyInfo(
+            tokenId,
+            salePrice
+            );
+        } else {
+            // 不支持版税，返回零地址和零金额
+            receiver = address(0);
+            royaltyAmount = 0;
+        }
     }
 
     function _payout(address paymentToken, address to, uint256 amount) internal {
