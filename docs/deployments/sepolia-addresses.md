@@ -1,7 +1,5 @@
 # Sepolia Deployment Addresses
 
-状态：待部署
-
 执行命令：
 
 ```bash
