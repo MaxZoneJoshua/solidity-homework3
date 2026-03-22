@@ -1,17 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {ERC721HolderUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/utils/ERC721HolderUpgradeable.sol";
 
 /// @title NFTAuctionMarket
-/// @notice 支持 ETH / ERC20 出价的 NFT 拍卖市场，包含平台手续费与 ERC2981 版税结算。
-contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
+/// @notice 支持 ETH / ERC20 出价的 NFT 拍卖市场，包含平台手续费、ERC2981 版税结算、Chainlink USD 价格换算与 UUPS 升级能力。
+contract NFTAuctionMarket is
+    Initializable,
+    OwnableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable,
+    ERC721HolderUpgradeable
+{
     using SafeERC20 for IERC20;
 
     struct Auction {
@@ -35,19 +46,26 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
     error AuctionAlreadyEnded();
     error SellerCannotBid();
     error BidTooLow(uint256 minimumBid);
-    error NotFeeRecipient();
+    error NotMarketAdmin();
     error UnsupportedPaymentToken();
     error TransferFailed();
     error InvalidRoyalty(uint256 fee, uint256 royalty, uint256 salePrice);
+    error PriceFeedNotSet(address paymentToken);
+    error InvalidPriceFeed(address feed);
+    error InvalidOraclePrice(address paymentToken);
+    error MissingTokenMetadata(address token);
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant DEFAULT_PLATFORM_FEE = 250; // 2.5%
     uint256 public constant MAX_PLATFORM_FEE = 1_000; // 10%
+    uint8 public constant USD_DECIMALS = 18;
 
     mapping(uint256 auctionId => Auction) public auctions;
     mapping(uint256 auctionId => mapping(address bidder => uint256 amount)) public pendingReturns;
+    mapping(address paymentToken => address priceFeed) public usdPriceFeeds;
 
     uint256 public auctionCounter;
-    uint256 public platformFee = 250; // 2.5%
+    uint256 public platformFee;
     address public feeRecipient;
 
     event AuctionCreated(
@@ -57,6 +75,7 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         uint256 tokenId,
         address paymentToken,
         uint256 startPrice,
+        uint256 startPriceUsd,
         uint256 endTime
     );
 
@@ -64,6 +83,7 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         uint256 indexed auctionId,
         address indexed bidder,
         uint256 amount,
+        uint256 amountUsd,
         address paymentToken
     );
 
@@ -71,6 +91,7 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         uint256 indexed auctionId,
         address indexed winner,
         uint256 finalPrice,
+        uint256 finalPriceUsd,
         address paymentToken
     );
 
@@ -83,18 +104,35 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
 
     event PlatformFeeUpdated(uint256 newFee);
     event FeeRecipientUpdated(address indexed newRecipient);
+    event PriceFeedUpdated(address indexed paymentToken, address indexed feed);
 
-    constructor(address _feeRecipient) {
-        if (_feeRecipient == address(0)) revert InvalidAddress();
-        feeRecipient = _feeRecipient;
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice 通过代理部署后初始化市场合约。
+    /// @param initialOwner 代理管理员/升级管理员。
+    /// @param initialFeeRecipient 平台手续费接收地址。
+    function initialize(address initialOwner, address initialFeeRecipient) external initializer {
+        if (initialOwner == address(0) || initialFeeRecipient == address(0)) {
+            revert InvalidAddress();
+        }
+
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+        __ERC721Holder_init();
+
+        if (initialOwner != _msgSender()) {
+            _transferOwnership(initialOwner);
+        }
+
+        feeRecipient = initialFeeRecipient;
+        platformFee = DEFAULT_PLATFORM_FEE;
     }
 
     /// @notice 创建拍卖并将 NFT 托管到市场合约。
-    /// @param nftContract NFT 合约地址。
-    /// @param tokenId NFT tokenId。
-    /// @param paymentToken 支付代币，address(0) 表示 ETH。
-    /// @param startPrice 起拍价。
-    /// @param durationHours 拍卖持续时间，单位小时。
     function createAuction(
         address nftContract,
         uint256 tokenId,
@@ -109,11 +147,14 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
             revert UnsupportedPaymentToken();
         }
 
+        _requirePriceFeedConfigured(paymentToken);
+
         IERC721 nft = IERC721(nftContract);
         if (nft.ownerOf(tokenId) != msg.sender) revert InvalidAuction();
 
         auctionId = ++auctionCounter;
         uint256 endTime = block.timestamp + (durationHours * 1 hours);
+        uint256 startPriceUsd = getUsdValue(paymentToken, startPrice);
 
         auctions[auctionId] = Auction({
             seller: msg.sender,
@@ -136,6 +177,7 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
             tokenId,
             paymentToken,
             startPrice,
+            startPriceUsd,
             endTime
         );
     }
@@ -164,7 +206,13 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         auction.highestBid = amount;
         auction.highestBidder = msg.sender;
 
-        emit BidPlaced(auctionId, msg.sender, amount, auction.paymentToken);
+        emit BidPlaced(
+            auctionId,
+            msg.sender,
+            amount,
+            getUsdValue(auction.paymentToken, amount),
+            auction.paymentToken
+        );
     }
 
     /// @notice 提取被超越后的退款。
@@ -188,10 +236,9 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         auction.active = false;
 
         IERC721 nft = IERC721(auction.nftContract);
-
         if (auction.highestBidder == address(0)) {
             nft.safeTransferFrom(address(this), auction.seller, auction.tokenId);
-            emit AuctionEnded(auctionId, address(0), 0, auction.paymentToken);
+            emit AuctionEnded(auctionId, address(0), 0, 0, auction.paymentToken);
             return;
         }
 
@@ -222,6 +269,7 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
             auctionId,
             auction.highestBidder,
             auction.highestBid,
+            getUsdValue(auction.paymentToken, auction.highestBid),
             auction.paymentToken
         );
     }
@@ -233,20 +281,68 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         return auction.highestBid == 0 ? auction.startPrice : auction.highestBid + 1;
     }
 
-    /// @notice 设置平台手续费，只有手续费接收地址可调用。
-    function setPlatformFee(uint256 newFee) external {
-        if (msg.sender != feeRecipient) revert NotFeeRecipient();
+    /// @notice 查询某个支付币种金额对应的美元价值，统一返回 18 位小数精度。
+    function getUsdValue(address paymentToken, uint256 amount) public view returns (uint256) {
+        if (amount == 0) return 0;
+
+        address feed = usdPriceFeeds[paymentToken];
+        if (feed == address(0)) revert PriceFeedNotSet(paymentToken);
+
+        (, int256 answer,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
+        if (answer <= 0 || updatedAt == 0) revert InvalidOraclePrice(paymentToken);
+
+        uint256 normalizedPrice = _scalePrice(uint256(answer), AggregatorV3Interface(feed).decimals());
+        uint256 assetDecimals = _getAssetDecimals(paymentToken);
+
+        return (amount * normalizedPrice) / (10 ** assetDecimals);
+    }
+
+    /// @notice 查询拍卖当前价格对应的美元价值，返回起拍价、当前最高出价和下一个最小出价的 USD 估值。
+    function getAuctionUsdPricing(uint256 auctionId)
+        external
+        view
+        returns (uint256 startPriceUsd, uint256 highestBidUsd, uint256 minimumBidUsd)
+    {
+        Auction memory auction = auctions[auctionId];
+        if (auction.seller == address(0)) revert InvalidAuction();
+
+        startPriceUsd = getUsdValue(auction.paymentToken, auction.startPrice);
+        highestBidUsd = getUsdValue(auction.paymentToken, auction.highestBid);
+        minimumBidUsd = getUsdValue(
+            auction.paymentToken,
+            auction.highestBid == 0 ? auction.startPrice : auction.highestBid + 1
+        );
+    }
+
+    /// @notice 设置平台手续费，仅市场管理员可调用。
+    function setPlatformFee(uint256 newFee) external onlyMarketAdmin {
         if (newFee > MAX_PLATFORM_FEE) revert InvalidAmount();
         platformFee = newFee;
         emit PlatformFeeUpdated(newFee);
     }
 
-    /// @notice 更新手续费接收地址，只有当前手续费接收地址可调用。
-    function updateFeeRecipient(address newRecipient) external {
-        if (msg.sender != feeRecipient) revert NotFeeRecipient();
+    /// @notice 更新手续费接收地址，仅市场管理员可调用。
+    function updateFeeRecipient(address newRecipient) external onlyMarketAdmin {
         if (newRecipient == address(0)) revert InvalidAddress();
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(newRecipient);
+    }
+
+    /// @notice 设置 ETH 或 ERC20 对 USD 的 Chainlink Data Feed，仅市场管理员可调用。
+    function setUsdPriceFeed(address paymentToken, address feed) external onlyMarketAdmin {
+        if (feed == address(0) || feed.code.length == 0) revert InvalidPriceFeed(feed);
+        usdPriceFeeds[paymentToken] = feed;
+        emit PriceFeedUpdated(paymentToken, feed);
+    }
+
+    /// @notice 返回当前实现版本号，方便前端或脚本识别升级后的实现版本。
+    function version() external pure virtual returns (uint256) {
+        return 1;
+    }
+
+    modifier onlyMarketAdmin() {
+        if (msg.sender != owner()) revert NotMarketAdmin();
+        _;
     }
 
     function _getRoyaltyInfo(
@@ -254,27 +350,55 @@ contract NFTAuctionMarket is ReentrancyGuard, ERC721Holder {
         uint256 tokenId,
         uint256 salePrice
     ) internal view returns (address receiver, uint256 royaltyAmount) {
-        // 检查NFT合约是否支持ERC2981
-        if (IERC165(nftContract).supportsInterface(type(IERC2981).interfaceId)) {
-            (receiver, royaltyAmount) = IERC2981(nftContract).royaltyInfo(
-            tokenId,
-            salePrice
-            );
-        } else {
-            // 不支持版税，返回零地址和零金额
-            receiver = address(0);
-            royaltyAmount = 0;
-        }
+        try IERC165(nftContract).supportsInterface(type(IERC2981).interfaceId) returns (bool supported) {
+            if (supported) {
+                return IERC2981(nftContract).royaltyInfo(tokenId, salePrice);
+            }
+        } catch {}
+
+        return (address(0), 0);
     }
 
     function _payout(address paymentToken, address to, uint256 amount) internal {
         if (amount == 0) return;
 
         if (paymentToken == address(0)) {
-            (bool success, ) = payable(to).call{value: amount}("");
+            (bool success,) = payable(to).call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
             IERC20(paymentToken).safeTransfer(to, amount);
         }
     }
+
+    function _requirePriceFeedConfigured(address paymentToken) internal view {
+        if (usdPriceFeeds[paymentToken] == address(0)) {
+            revert PriceFeedNotSet(paymentToken);
+        }
+    }
+
+    function _getAssetDecimals(address paymentToken) internal view returns (uint8) {
+        if (paymentToken == address(0)) {
+            return 18;
+        }
+
+        try IERC20Metadata(paymentToken).decimals() returns (uint8 tokenDecimals) {
+            return tokenDecimals;
+        } catch {
+            revert MissingTokenMetadata(paymentToken);
+        }
+    }
+
+    function _scalePrice(uint256 price, uint8 feedDecimals) internal pure returns (uint256) {
+        if (feedDecimals == USD_DECIMALS) {
+            return price;
+        }
+        if (feedDecimals < USD_DECIMALS) {
+            return price * (10 ** (USD_DECIMALS - feedDecimals));
+        }
+        return price / (10 ** (feedDecimals - USD_DECIMALS));
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyMarketAdmin {}
+
+    uint256[46] private __gap;
 }

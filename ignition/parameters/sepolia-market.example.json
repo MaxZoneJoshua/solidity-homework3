@@ -1,0 +1,10 @@
+{
+  "NFTAuctionMarketSepoliaModule": {
+    "owner": "0xYourSepoliaAdminAddress",
+    "feeRecipient": "0xYourFeeRecipientAddress",
+    "nftOwner": "0xYourNftOwnerAddress",
+    "ethUsdFeed": "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+    "paymentToken": "0xYourSepoliaErc20Address",
+    "paymentTokenUsdFeed": "0xYourChainlinkTokenUsdFeedAddress"
+  }
+}
